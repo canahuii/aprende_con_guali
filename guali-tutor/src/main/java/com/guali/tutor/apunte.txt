@@ -1,0 +1,865 @@
+package com.guali.tutor.controller;
+
+import com.guali.tutor.form.MainForm;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URL;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+
+import edu.umg.guali.compiler.GualiDev;
+import edu.umg.guali.compiler.CompileResult;
+import edu.umg.guali.compiler.ExecuteResult;
+import javax.swing.JOptionPane;
+
+public class MainController {
+
+    private static final float TAMANO_FUENTE_MIN = 8f;
+    private static final float TAMANO_FUENTE_MAX = 28f;
+
+    // Ruta por defecto del recurso interno en resources
+    private static final String CARPETA_LECCION_POR_DEFECTO = "/lecciones/leccion-01/";
+
+    private final MainForm view;
+    private final HttpClient httpClient = HttpClient.newHttpClient();
+
+    private float tamanoFuente = 13f;
+
+    private String ultimaClaseCompilada = null;
+
+    private File carpetaLeccionActiva = null;
+    private String objetivoLeccionActual = null;
+    private String fechaInicioLeccionActiva = null;
+
+    public MainController(MainForm view) {
+        this.view = view;
+        wireListeners();
+
+        // Carga automáticamente la lección por defecto de los recursos al iniciar
+        cargarLeccionInicial();
+    }
+
+    /**
+     * Carga la lección inicial embebida en los recursos del proyecto.
+     */
+    private void cargarLeccionInicial() {
+        try {
+            URL urlBase = getClass().getResource(CARPETA_LECCION_POR_DEFECTO);
+            if (urlBase != null) {
+                view.setBaseLeccion(urlBase);
+
+                String markdown = cargarMarkdownDesdeRecurso(CARPETA_LECCION_POR_DEFECTO + "leccion.md");
+                if (markdown == null) {
+                    markdown = cargarMarkdownDesdeRecurso(CARPETA_LECCION_POR_DEFECTO + "example.md");
+                }
+
+                if (markdown != null) {
+                    view.setLeccionMarkdown(markdown);
+                    view.setNombreLeccionActiva("leccion-01");
+                    logConsola("[Lección] Lección inicial cargada correctamente.");
+                } else {
+                    logConsola("[Error] No se encontró 'leccion.md' ni 'example.md' en los recursos.");
+                }
+            } else {
+                logConsola("[Error] No se encontró el recurso: " + CARPETA_LECCION_POR_DEFECTO);
+            }
+        } catch (Exception e) {
+            logConsola("[Error] Error al cargar la lección inicial: " + e.getMessage());
+        }
+    }
+
+    private String cargarMarkdownDesdeRecurso(String rutaRecurso) {
+        try (InputStream in = getClass().getResourceAsStream(rutaRecurso)) {
+            if (in == null) return null;
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Permite abrir lecciones externas desde cualquier carpeta del disco.
+     */
+    private void abrirLeccionDesdeDisco() {
+        String rutaCarpeta = view.solicitarCarpetaLeccion();
+        if (rutaCarpeta == null || rutaCarpeta.trim().isEmpty()) {
+            return; // El usuario canceló la selección
+        }
+
+        File carpeta = new File(rutaCarpeta);
+
+        File archivoMarkdown = new File(carpeta, "leccion.md");
+        if (!archivoMarkdown.exists()) {
+            archivoMarkdown = new File(carpeta, "example.md");
+        }
+
+        if (!archivoMarkdown.exists()) {
+            logConsola("[Error] No se encontró 'leccion.md' ni 'example.md' en: " + rutaCarpeta);
+            return;
+        }
+
+        try {
+            String contenidoMarkdown = Files.readString(archivoMarkdown.toPath(), StandardCharsets.UTF_8);
+
+            this.carpetaLeccionActiva = carpeta;
+            this.fechaInicioLeccionActiva = java.time.LocalDateTime.now()
+                    .format(java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy hh:mm:ss a"));
+            this.objetivoLeccionActual = obtenerObjetivoLeccion(carpeta);
+
+            view.limpiarEditorCodigo();
+            view.setBaseLeccion(carpeta.toURI().toURL());
+            view.setLeccionMarkdown(contenidoMarkdown);
+            view.setNombreLeccionActiva(carpeta.getName());
+
+            logConsola("[Lección] Lección cargada exitosamente desde: " + carpeta.getName());
+            if (objetivoLeccionActual != null) {
+                logConsola("[Objetivo] Objetivo de la lección: " + objetivoLeccionActual);
+            }
+
+        } catch (IOException e) {
+            logConsola("[Error] Ocurrió un problema al leer la lección: " + e.getMessage());
+        }
+    }
+
+    private void wireListeners() {
+        view.getAbrirLeccion().addActionListener(e -> abrirLeccionDesdeDisco());
+        view.getCerrarLeccion().addActionListener(e -> cerrarLeccion());
+
+        view.getImportarLeccionBD().addActionListener(e -> importarLeccionABd());
+        view.getSeleccionarLeccionBD().addActionListener(e -> seleccionarLeccionDeBd());
+        view.getEliminarLeccionBD().addActionListener(e -> eliminarLeccionDeBd());
+
+        view.getConfiguracion().addActionListener(e -> abrirConfiguracion());
+        view.getHistorial().addActionListener(e -> mostrarHistorialModal());
+        view.getAyuda().addActionListener(e -> mostrarAyuda());
+
+        view.getBtnCompilar().addActionListener(e -> compilarCodigo());
+        view.getBtnEjecutar().addActionListener(e -> ejecutarCodigo());
+
+        view.getBtnZoomIn().addActionListener(e -> ajustarZoom(1f));
+        view.getBtnZoomOut().addActionListener(e -> ajustarZoom(-1f));
+    }
+
+    private void abrirConfiguracion() {
+        String ubicacionJdk = view.solicitarUbicacionJdk();
+
+        if (ubicacionJdk != null && !ubicacionJdk.trim().isEmpty()) {
+            boolean exito = guardarJdkRest(ubicacionJdk.trim());
+            if (exito) {
+                logConsola("[Configuración] JDK guardado correctamente en la BD vía API REST: " + ubicacionJdk);
+                view.getBtnCompilar().setEnabled(true);
+            } else {
+                logConsola("[Error REST] No se pudo guardar la configuración del JDK en el Back-End.");
+            }
+        }
+    }
+
+    private void ajustarZoom(float delta) {
+        tamanoFuente = Math.max(TAMANO_FUENTE_MIN, Math.min(TAMANO_FUENTE_MAX, tamanoFuente + delta));
+        view.setTamanoFuente(tamanoFuente);
+    }
+
+    private void logConsola(String mensaje) {
+        view.appendConsola(mensaje);
+    }
+
+    private void cerrarLeccion() {
+        view.vaciarLeccionActiva();
+        this.carpetaLeccionActiva = null;
+        this.objetivoLeccionActual = null;
+        logConsola("[Lección] Se ha cerrado la lección activa.");
+    }
+
+    private void compilarCodigo() {
+        String jdkPath = obtenerJdkRest();
+
+        if (jdkPath == null || jdkPath.trim().isEmpty()) {
+            logConsola("[Aviso] Debe configurar la ubicación del JDK antes de compilar.");
+            abrirConfiguracion();
+            return;
+        }
+
+        String codigoFuente = view.getCodigoEditor().getText();
+
+        if (codigoFuente == null || codigoFuente.trim().isEmpty()) {
+            logConsola("[Aviso] El editor de código está vacío. Escriba código Java antes de compilar.");
+            return;
+        }
+
+        logConsola("[Compilación] Compilando código...");
+
+        try {
+            CompileResult resultado = GualiDev.compile(codigoFuente, jdkPath);
+            logConsola(resultado.getSalida());
+
+            boolean exitoCompilacion = resultado.isExitoso();
+
+            if (exitoCompilacion) {
+                this.ultimaClaseCompilada = resultado.getNombreClase();
+                logConsola("[Éxito] Compilado correctamente. Clase: " + ultimaClaseCompilada);
+                view.getBtnEjecutar().setEnabled(true);
+            } else {
+                this.ultimaClaseCompilada = null;
+                logConsola("[Error] Ocurrieron errores de compilación.");
+                view.getBtnEjecutar().setEnabled(false);
+            }
+
+            if (objetivoLeccionActual != null) {
+                boolean cumploObjetivo = validarObjetivo("COMPILAR", exitoCompilacion, objetivoLeccionActual);
+                if (cumploObjetivo) {
+                    logConsola("[Objetivo] ¡FELICIDADES! Has completado el objetivo de la lección: " + objetivoLeccionActual);
+                } else {
+                    logConsola("[Objetivo] Intento no cumple con el objetivo esperado: " + objetivoLeccionActual);
+                }
+
+                String estado = cumploObjetivo ? "Completada" : "Pendiente";
+                String nombreLeccion = obtenerNombreLeccionActiva();
+
+                if (nombreLeccion != null && !nombreLeccion.isBlank()) {
+                    registrarEnHistorialRest(nombreLeccion, estado);
+                }
+
+                if (cumploObjetivo) {
+                    finalizarLeccionExitosa();
+                }
+            }
+
+        } catch (Exception e) {
+            logConsola("[Error Compilador] Error durante la compilación: " + e.getMessage());
+            view.getBtnEjecutar().setEnabled(false);
+        }
+    }
+
+    private void ejecutarCodigo() {
+        String jdkPath = obtenerJdkRest();
+
+        if (jdkPath == null || jdkPath.trim().isEmpty()) {
+            logConsola("[Aviso] Debe configurar la ubicación del JDK antes de ejecutar.");
+            abrirConfiguracion();
+            return;
+        }
+
+        if (ultimaClaseCompilada == null || ultimaClaseCompilada.trim().isEmpty()) {
+            logConsola("[Aviso] Debe compilar el código exitosamente antes de ejecutar.");
+            return;
+        }
+
+        logConsola("[Ejecución] Ejecutando el programa...");
+
+        try {
+            ExecuteResult resultado = GualiDev.execute(ultimaClaseCompilada, jdkPath);
+
+            if (resultado.getSalida() != null && !resultado.getSalida().isEmpty()) {
+                logConsola(resultado.getSalida());
+            }
+
+            boolean exitoEjecucion = resultado.isExitoso();
+
+            if (exitoEjecucion) {
+                logConsola("[Proceso] Programa finalizado con éxito (código 0).");
+            } else {
+                logConsola("[Proceso] El programa finalizó con errores.");
+            }
+
+            if (objetivoLeccionActual != null) {
+                boolean cumploObjetivo = validarObjetivo("EJECUTAR", exitoEjecucion, objetivoLeccionActual);
+                if (cumploObjetivo) {
+                    logConsola("[Objetivo] ¡FELICIDADES! Has completado el objetivo de la lección: " + objetivoLeccionActual);
+                } else {
+                    logConsola("[Objetivo] Intento no cumple con el objetivo esperado: " + objetivoLeccionActual);
+                }
+
+                String estado = cumploObjetivo ? "Completada" : "Pendiente";
+                String nombreLeccion = obtenerNombreLeccionActiva();
+
+                if (nombreLeccion != null && !nombreLeccion.isBlank()) {
+                    registrarEnHistorialRest(nombreLeccion, estado);
+                }
+
+                if (cumploObjetivo) {
+                    finalizarLeccionExitosa();
+                }
+            }
+
+        } catch (Exception e) {
+            logConsola("[Error Ejecución] Error al intentar ejecutar: " + e.getMessage());
+        }
+    }
+
+    private void mostrarAyuda() {
+        String mensajeAyuda = """
+        ====================================================
+                       GUÍA DE USO - GUALI TUTOR
+        ====================================================
+
+        1. CARGAR LECCIONES:
+           • Usa 'Lecciones -> Abrir Lección' para seleccionar la carpeta
+             de una lección guardada en tu equipo.
+           • O usa 'Lecciones -> Seleccionar Lección de BD' para cargar
+             una lección desde la base de datos H2.
+
+        2. ESCRIBIR CÓDIGO:
+           • Lee la teoría y las instrucciones en el panel izquierdo.
+           • Escribe tu solución en Java en el editor del panel derecho.
+
+        3. COMPILAR Y EJECUTAR:
+           • 'Compilar': Verifica la sintaxis de tu código usando el JDK.
+           • 'Ejecutar': Corre el programa compilado y muestra la salida.
+
+        4. CONFIGURACIÓN & HISTORIAL:
+           • Registra el JDK y consulta el historial de tus intentos.
+        """;
+
+        JOptionPane.showMessageDialog(
+                view,
+                mensajeAyuda,
+                "Ayuda de la Aplicación",
+                JOptionPane.INFORMATION_MESSAGE
+        );
+    }
+
+    // ADMINISTRAR LECCIONES VÍA API REST (H2)
+    private void importarLeccionABd() {
+        if (carpetaLeccionActiva == null || !carpetaLeccionActiva.exists()) {
+            JOptionPane.showMessageDialog(
+                    view,
+                    "Por favor, abre primero una lección desde disco antes de importarla.",
+                    "Sin lección activa",
+                    JOptionPane.WARNING_MESSAGE
+            );
+            return;
+        }
+
+        try {
+            String titulo = carpetaLeccionActiva.getName();
+            File archivoMarkdown = new File(carpetaLeccionActiva, "leccion.md");
+            if (!archivoMarkdown.exists()) {
+                archivoMarkdown = new File(carpetaLeccionActiva, "example.md");
+            }
+
+            if (!archivoMarkdown.exists()) {
+                logConsola("[Error] No se encontró el archivo markdown de la lección.");
+                return;
+            }
+
+            String contenidoMarkdown = Files.readString(archivoMarkdown.toPath(), StandardCharsets.UTF_8);
+            String objetivo = (objetivoLeccionActual != null) ? objetivoLeccionActual : "EJECUTAR_EXITOSO";
+
+            // Escapar caracteres adecuadamente para enviar JSON limpio
+            String jsonMarkdownEscaped = contenidoMarkdown
+                    .replace("\\", "\\\\")
+                    .replace("\"", "\\\"")
+                    .replace("\b", "\\b")
+                    .replace("\f", "\\f")
+                    .replace("\n", "\\n")
+                    .replace("\r", "\\r")
+                    .replace("\t", "\\t");
+
+            String jsonInput = String.format(
+                    "{\"titulo\":\"%s\", \"contenidoMarkdown\":\"%s\", \"objetivo\":\"%s\"}",
+                    titulo, jsonMarkdownEscaped, objetivo
+            );
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://localhost:8080/api/lecciones"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonInput))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200 || response.statusCode() == 201) {
+                logConsola("[BD H2] Lección '" + titulo + "' importada con éxito en la BD.");
+                JOptionPane.showMessageDialog(
+                        view,
+                        "La lección '" + titulo + "' se guardó correctamente en la base de datos.",
+                        "Éxito",
+                        JOptionPane.INFORMATION_MESSAGE
+                );
+            } else {
+                logConsola("[Error REST] No se pudo guardar la lección en BD. Status: " + response.statusCode());
+            }
+
+        } catch (Exception e) {
+            logConsola("[Error REST] Fallo al importar lección a BD: " + e.getMessage());
+        }
+    }
+
+    private void seleccionarLeccionDeBd() {
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://localhost:8080/api/lecciones"))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                String jsonResponse = response.body();
+
+                if (jsonResponse == null || jsonResponse.trim().equals("[]")) {
+                    JOptionPane.showMessageDialog(
+                            view,
+                            "No hay lecciones guardadas en la base de datos. Importa una primero.",
+                            "Sin lecciones en BD",
+                            JOptionPane.INFORMATION_MESSAGE
+                    );
+                    return;
+                }
+
+                java.util.List<String> titulos = new java.util.ArrayList<>();
+                java.util.List<String> markdowns = new java.util.ArrayList<>();
+                java.util.List<String> objetivos = new java.util.ArrayList<>();
+
+                if (jsonResponse.startsWith("[")) {
+                    String contenido = jsonResponse.substring(1, jsonResponse.length() - 1);
+                    String[] items = contenido.split("\\},\\s*\\{");
+                    for (String item : items) {
+                        String t = extraerValorJson(item, "titulo");
+                        String m = extraerValorJson(item, "contenidoMarkdown");
+                        String o = extraerValorJson(item, "objetivo");
+
+                        if (!t.isBlank()) {
+                            titulos.add(t);
+                            markdowns.add(m);
+                            objetivos.add(o);
+                        }
+                    }
+                }
+
+                if (titulos.isEmpty()) {
+                    logConsola("[BD H2] No se encontraron lecciones registradas.");
+                    return;
+                }
+
+                String[] opciones = titulos.toArray(new String[0]);
+                String seleccion = (String) JOptionPane.showInputDialog(
+                        view,
+                        "Selecciona una lección almacenada en la Base de Datos:",
+                        "Cargar Lección desde BD",
+                        JOptionPane.QUESTION_MESSAGE,
+                        null,
+                        opciones,
+                        opciones[0]
+                );
+
+                if (seleccion != null) {
+                    int index = titulos.indexOf(seleccion);
+
+                    // Desescapar caracteres JSON
+                    String markdown = markdowns.get(index)
+                            .replace("\\n", "\n")
+                            .replace("\\r", "\r")
+                            .replace("\\t", "\t")
+                            .replace("\\\"", "\"")
+                            .replace("\\\\", "\\");
+
+                    String objetivo = objetivos.get(index);
+
+                    // Asignación de la ruta base de las imágenes
+                    boolean baseUbicada = false;
+
+                    if (this.carpetaLeccionActiva != null && this.carpetaLeccionActiva.getName().equals(seleccion)) {
+                        view.setBaseLeccion(this.carpetaLeccionActiva.toURI().toURL());
+                        baseUbicada = true;
+                    }
+
+                    if (!baseUbicada) {
+                        File carpetaLocal = new File("lecciones/" + seleccion);
+                        if (!carpetaLocal.exists()) {
+                            carpetaLocal = new File(seleccion);
+                        }
+                        if (carpetaLocal.exists()) {
+                            view.setBaseLeccion(carpetaLocal.toURI().toURL());
+                            this.carpetaLeccionActiva = carpetaLocal;
+                            baseUbicada = true;
+                        }
+                    }
+
+                    if (!baseUbicada) {
+                        URL urlBase = getClass().getResource("/lecciones/" + seleccion + "/");
+                        if (urlBase != null) {
+                            view.setBaseLeccion(urlBase);
+                        }
+                    }
+
+                    view.limpiarEditorCodigo();
+                    view.setLeccionMarkdown(markdown);
+                    view.setNombreLeccionActiva(seleccion);
+
+                    this.objetivoLeccionActual = objetivo;
+                    this.fechaInicioLeccionActiva = java.time.LocalDateTime.now()
+                            .format(java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy hh:mm:ss a"));
+
+                    logConsola("[Lección BD] Lección '" + seleccion + "' cargada exitosamente desde H2.");
+                    logConsola("[Objetivo] Objetivo: " + objetivo);
+                }
+
+            } else {
+                logConsola("[Error REST] Error al consultar lecciones desde BD.");
+            }
+
+        } catch (Exception e) {
+            logConsola("[Error REST] Fallo al consultar lecciones de BD: " + e.getMessage());
+        }
+    }
+
+    private void eliminarLeccionDeBd() {
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://localhost:8080/api/lecciones"))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                String jsonResponse = response.body();
+
+                if (jsonResponse == null || jsonResponse.trim().equals("[]")) {
+                    JOptionPane.showMessageDialog(
+                            view,
+                            "No hay lecciones para eliminar en la base de datos.",
+                            "Sin lecciones",
+                            JOptionPane.INFORMATION_MESSAGE
+                    );
+                    return;
+                }
+
+                java.util.List<String> ids = new java.util.ArrayList<>();
+                java.util.List<String> titulos = new java.util.ArrayList<>();
+
+                if (jsonResponse.startsWith("[")) {
+                    String contenido = jsonResponse.substring(1, jsonResponse.length() - 1);
+                    String[] items = contenido.split("\\},\\s*\\{");
+                    for (String item : items) {
+                        String id = extraerNumeroJson(item, "id");
+                        String t = extraerValorJson(item, "titulo");
+
+                        if (!t.isBlank() && !id.isBlank()) {
+                            ids.add(id);
+                            titulos.add(t);
+                        }
+                    }
+                }
+
+                if (titulos.isEmpty()) {
+                    logConsola("[BD H2] No hay lecciones válidas para eliminar.");
+                    return;
+                }
+
+                String[] opciones = titulos.toArray(new String[0]);
+                String seleccion = (String) JOptionPane.showInputDialog(
+                        view,
+                        "Selecciona la lección que deseas eliminar de la BD:",
+                        "Eliminar Lección de BD",
+                        JOptionPane.WARNING_MESSAGE,
+                        null,
+                        opciones,
+                        opciones[0]
+                );
+
+                if (seleccion != null) {
+                    int index = titulos.indexOf(seleccion);
+                    String idAEliminar = ids.get(index);
+
+                    HttpRequest deleteRequest = HttpRequest.newBuilder()
+                            .uri(URI.create("http://localhost:8080/api/lecciones/" + idAEliminar))
+                            .DELETE()
+                            .build();
+
+                    HttpResponse<String> deleteResponse = httpClient.send(deleteRequest, HttpResponse.BodyHandlers.ofString());
+
+                    if (deleteResponse.statusCode() == 204 || deleteResponse.statusCode() == 200) {
+                        logConsola("[BD H2] Lección '" + seleccion + "' (ID: " + idAEliminar + ") eliminada correctamente de la BD.");
+                        JOptionPane.showMessageDialog(
+                                view,
+                                "La lección '" + seleccion + "' ha sido eliminada de la base de datos.",
+                                "Eliminada",
+                                JOptionPane.INFORMATION_MESSAGE
+                        );
+                    } else {
+                        logConsola("[Error REST] No se pudo eliminar la lección. Status: " + deleteResponse.statusCode());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logConsola("[Error REST] Fallo al eliminar lección de BD: " + e.getMessage());
+        }
+    }
+
+    private boolean guardarJdkRest(String ubicacionJdk) {
+        try {
+            String rutaLimpia = ubicacionJdk.replace("\\", "\\\\");
+            String jsonInput = String.format("{\"jdkPath\":\"%s\"}", rutaLimpia);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://localhost:8080/api/configuracion"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonInput))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            return response.statusCode() == 200 || response.statusCode() == 201;
+        } catch (Exception e) {
+            logConsola("[Error REST] Error al conectar con la API REST: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private String obtenerJdkRest() {
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://localhost:8080/api/configuracion"))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200 && response.body() != null && !response.body().isBlank()) {
+                String body = response.body();
+
+                int keyIndex = body.indexOf("jdkPath");
+                if (keyIndex == -1) {
+                    keyIndex = body.indexOf("jdk_path");
+                }
+
+                if (keyIndex != -1) {
+                    int startQuote = body.indexOf("\"", keyIndex + 8);
+                    if (startQuote != -1) {
+                        int endQuote = body.indexOf("\"", startQuote + 1);
+                        if (endQuote != -1) {
+                            String ruta = body.substring(startQuote + 1, endQuote);
+                            return ruta.replace("\\\\", "\\");
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logConsola("[Error REST] No se pudo consultar la configuración del JDK: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private String obtenerObjetivoLeccion(File carpetaLeccion) {
+        if (carpetaLeccion == null) return null;
+        File archivoConfig = new File(carpetaLeccion, "config.txt");
+        if (!archivoConfig.exists()) {
+            return null;
+        }
+        try {
+            String contenido = Files.readString(archivoConfig.toPath(), StandardCharsets.UTF_8).trim();
+            if (contenido.startsWith("objetivo=")) {
+                return contenido.replace("objetivo=", "").trim();
+            } else if (contenido.startsWith("objetivo-")) {
+                return contenido.replace("objetivo-", "").trim();
+            }
+            return contenido;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private boolean validarObjetivo(String accion, boolean exito, String objetivoEsperado) {
+        if (objetivoEsperado == null) return false;
+
+        switch (objetivoEsperado.toUpperCase()) {
+            case "COMPILAR_CON_ERROR":
+            case "COMPILAR CON ERROR":
+                return "COMPILAR".equals(accion) && !exito;
+
+            case "COMPILAR_EXITOSO":
+            case "COMPILAR EXITOSO":
+                return "COMPILAR".equals(accion) && exito;
+
+            case "EJECUTAR_CON_ERROR":
+            case "EJECUTAR CON ERROR":
+                return "EJECUTAR".equals(accion) && !exito;
+
+            case "EJECUTAR_EXITOSO":
+            case "EJECUTAR EXITOSO":
+                return "EJECUTAR".equals(accion) && exito;
+
+            default:
+                return false;
+        }
+    }
+
+    private void registrarEnHistorialRest(String nombreLeccion, String resultado) {
+        try {
+            String fechaFin = java.time.LocalDateTime.now()
+                    .format(java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy hh:mm:ss a"));
+
+            String fInicio = (fechaInicioLeccionActiva != null) ? fechaInicioLeccionActiva : fechaFin;
+
+            String jsonInput = String.format(
+                    "{\"leccionNombre\":\"%s\", \"fechaInicio\":\"%s\", \"fechaFin\":\"%s\", \"resultado\":\"%s\"}",
+                    nombreLeccion, fInicio, fechaFin, resultado
+            );
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://localhost:8080/api/historial"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonInput))
+                    .build();
+
+            httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString());
+        } catch (Exception e) {
+            logConsola("[Error REST] No se pudo guardar en el historial: " + e.getMessage());
+        }
+    }
+
+    private void mostrarHistorialModal() {
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://localhost:8080/api/historial"))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                String jsonResponse = response.body();
+
+                javax.swing.table.DefaultTableModel model = new javax.swing.table.DefaultTableModel(
+                        new String[]{"Lección", "Fecha Inicio", "Fecha Fin", "Resultado"}, 0
+                );
+
+                if (jsonResponse != null && jsonResponse.trim().startsWith("[")) {
+                    String contenido = jsonResponse.trim();
+                    contenido = contenido.substring(1, contenido.length() - 1).trim();
+
+                    if (!contenido.isEmpty()) {
+                        String[] items = contenido.split("\\},\\s*\\{");
+                        for (String item : items) {
+                            String leccion = extraerValorJson(item, "leccionNombre");
+                            String fInicio = extraerValorJson(item, "fechaInicio");
+                            String fFin = extraerValorJson(item, "fechaFin");
+                            String resultado = extraerValorJson(item, "resultado");
+
+                            if (leccion != null && !leccion.isBlank()) {
+                                model.addRow(new Object[]{leccion, fInicio, fFin, resultado});
+                            }
+                        }
+                    }
+                }
+
+                javax.swing.JTable tabla = new javax.swing.JTable(model);
+                tabla.setRowHeight(24);
+                javax.swing.JScrollPane scrollPane = new javax.swing.JScrollPane(tabla);
+                scrollPane.setPreferredSize(new java.awt.Dimension(680, 320));
+
+                JOptionPane.showMessageDialog(
+                        view,
+                        scrollPane,
+                        "Historial de Sesión",
+                        JOptionPane.PLAIN_MESSAGE
+                );
+            } else {
+                logConsola("[Error REST] Respuesta no esperada al consultar historial (Status " + response.statusCode() + ").");
+            }
+        } catch (Exception e) {
+            logConsola("[Error REST] Error al consultar el historial: " + e.getMessage());
+        }
+    }
+
+    // Auxiliar para extraer cadenas JSON soportando comillas escapadas
+    private String extraerValorJson(String json, String clave) {
+        int keyIndex = json.indexOf("\"" + clave + "\"");
+        if (keyIndex == -1) return "";
+        int startQuote = json.indexOf("\"", keyIndex + clave.length() + 3);
+        if (startQuote == -1) return "";
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = startQuote + 1; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (c == '\\' && i + 1 < json.length()) {
+                sb.append(c).append(json.charAt(i + 1));
+                i++; // Saltar el carácter escapado
+            } else if (c == '"') {
+                break; // Cierre real de la propiedad JSON
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    // Auxiliar para extraer valores numéricos como 'id'
+    private String extraerNumeroJson(String json, String clave) {
+        int keyIndex = json.indexOf("\"" + clave + "\"");
+        if (keyIndex == -1) return "";
+        int colonIndex = json.indexOf(":", keyIndex);
+        if (colonIndex == -1) return "";
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = colonIndex + 1; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (Character.isDigit(c)) {
+                sb.append(c);
+            } else if (!sb.isEmpty()) {
+                break; // Terminó de leer los dígitos del número
+            }
+        }
+        return sb.toString();
+    }
+
+    private void finalizarLeccionExitosa() {
+        int opcion = JOptionPane.showConfirmDialog(
+                view,
+                "¡Felicidades! Has completado con éxito el objetivo de esta lección.\n\n" +
+                        "¿Deseas seleccionar una nueva lección ahora?",
+                "¡Lección Completada!",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.INFORMATION_MESSAGE
+        );
+
+        if (opcion == JOptionPane.YES_OPTION) {
+            view.limpiarEditorCodigo();
+            view.getBtnEjecutar().setEnabled(false);
+            this.carpetaLeccionActiva = null;
+            this.objetivoLeccionActual = null;
+            this.fechaInicioLeccionActiva = null;
+
+            // Ofrecer cargar desde disco o desde BD
+            String[] opcionesOrigen = {"Desde disco local", "Desde Base de Datos (H2)"};
+            int seleccionOrigen = JOptionPane.showOptionDialog(
+                    view,
+                    "¿Desde dónde deseas cargar la nueva lección?",
+                    "Seleccionar Origen",
+                    JOptionPane.DEFAULT_OPTION,
+                    JOptionPane.QUESTION_MESSAGE,
+                    null,
+                    opcionesOrigen,
+                    opcionesOrigen[0]
+            );
+
+            if (seleccionOrigen == 0) {
+                abrirLeccionDesdeDisco();
+            } else if (seleccionOrigen == 1) {
+                seleccionarLeccionDeBd();
+            }
+        } else {
+            view.limpiarEditorCodigo();
+            view.getBtnEjecutar().setEnabled(false);
+            this.fechaInicioLeccionActiva = java.time.LocalDateTime.now()
+                    .format(java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy hh:mm:ss a"));
+
+            logConsola("[Lección] Puedes volver a intentar o practicar la lección actual.");
+        }
+    }
+    private String obtenerNombreLeccionActiva() {
+        if (this.carpetaLeccionActiva != null) {
+            return this.carpetaLeccionActiva.getName();
+        }
+        // Si no hay carpeta en disco pero hay una lección cargada desde la BD
+        return view.getNombreLeccionActiva();
+    }
+}
