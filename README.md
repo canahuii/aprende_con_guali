@@ -88,7 +88,7 @@ La API REST implementa una estrategia de conexión híbrida para garantizar la d
 
 1. **Clonar el repositorio:**
    ```bash
-   git clone [https://github.com/tu-usuario/nombre-del-repo-api.git](https://github.com/tu-usuario/nombre-del-repo-api.git)
+   git clone https://github.com/tu-usuario/nombre-del-repo-api.git
    ```
 2. **Abrir en IntelliJ IDEA:**
    * Abre IntelliJ IDEA y selecciona **Open**.
